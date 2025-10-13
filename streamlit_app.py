@@ -176,6 +176,14 @@ def _ensure_daily_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 internal_note_values = ["FCC", "FCM", "FCSH", "FCSC", "DTF", "DTFCE", "FCEX9", "FCEX10"]
 
+# Keep this where internal_note_values is defined
+GROUP_A_NOTES = {"FCC", "FCM", "FCSH", "FCSC", "FCEX9", "FCEX10"}
+GROUP_B_NOTES = {"DTF", "DTFCE"}
+
+# Union used to validate internal notes (main-block vs invalid footer)
+internal_note_values = sorted(list(GROUP_A_NOTES | GROUP_B_NOTES))
+
+
 def _collapse_ws_series(s: pd.Series) -> pd.Series:
     return (
         s.astype(object)
@@ -440,13 +448,16 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     """
     One row per trip.
     - Drop any row where Trip Taken == 'x' (strictly by the rendered flag).
-    - Keep refunds (Trip Taken == '-') in the main block.
-    - If include_refunds_bottom is True, also list refunds again in a footer.
-    - Sort/group visually by Last → First → Phone → refunds last → time.  <-- (no Internal Note)
+    - Keep refunds (Trip Taken == '-') in the main block (and optional footer).
+    - Sort/group visually by Bucket(A Fulton notes) → Bucket(B DTF/DTFCE) → Last → First → Phone → refunds last → time.
     - Totals are computed per rider EXCLUDING refunds.
     """
     import numpy as np
     import pandas as pd
+
+    # Buckets are defined globally above:
+    # GROUP_A_NOTES = {"FCC","FCM","FCSH","FCSC","FCEX9","FCEX10"}
+    # GROUP_B_NOTES = {"DTF","DTFCE"}
 
     if df is None or df.empty:
         return pd.DataFrame(columns=[
@@ -470,7 +481,7 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     last  = df.get("Last Name",  pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
     if (first.eq("").all() and last.eq("").all()) and ("Rider Name" in df.columns):
         name_series = df["Rider Name"].fillna("").astype(str)
-        first_last = name_series.apply(_split_first_last)  # keeps everything after first token as last name
+        first_last = name_series.apply(_split_first_last)
         first = first_last.apply(lambda x: x[0])
         last  = first_last.apply(lambda x: x[1])
 
@@ -484,7 +495,7 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     amt_num = pd.to_numeric(pd.Series(amt_raw).astype(str).str.replace(r"[^\d\.\-]", "", regex=True), errors="coerce")
     refund_mask = amt_num.lt(0)
     status_show = status_show.mask(refund_mask, "REFUND")
-    is_canceled = _is_canceled_series(status_show) | refund_mask  # used only to create Trip Taken
+    is_canceled = _is_canceled_series(status_show) | refund_mask
 
     # --- extras ---
     pickup_addr  = _col(df, "Pickup Address")
@@ -524,35 +535,44 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
 
     # Normalize Trip Taken, filter canceled
     tt_norm = out["Trip Taken"].astype(str).str.normalize("NFKC").str.strip().str.lower()
-    out = out.loc[~tt_norm.eq("x")].copy()      # ← drop all canceled rows
+    out = out.loc[~tt_norm.eq("x")].copy()
 
     # Helper flags/keys
     out["_is_refund"] = tt_norm.loc[out.index].eq("-").values
-
-    # (Still compute for validity check; not used in sorting)
     out["_internal_sort"] = out["Internal Note"].astype(str).str.upper().str.strip()
 
-    # Normalized sort keys so "J  HARRINGTON" == "J HARRINGTON"
+    # Normalized sort keys
     out["_first_sort"] = _collapse_ws_series(out["First Name"]).str.upper()
     out["_last_sort"]  = _collapse_ws_series(out["Last Name"]).str.upper()
     out["_phone_sort"] = _collapse_ws_series(out["Rider Phone #"])
 
-    # Visual sort (NO Internal Note): Last → First → Phone → refunds last → time
-    sort_cols = ["_last_sort", "_first_sort", "_phone_sort", "_is_refund", "Pick Up Time"]
+    # -------- Bucket by Internal Note --------
+    def _matches_any_token(s: pd.Series, tokens: set[str]) -> pd.Series:
+        if not tokens:
+            return pd.Series(False, index=s.index)
+        pat = r"\b(" + "|".join(map(re.escape, sorted(tokens, key=len, reverse=True))) + r")\b"
+        return s.str.contains(pat, regex=True, na=False)
+
+    in_group_a = _matches_any_token(out["_internal_sort"], set(GROUP_A_NOTES))
+    in_group_b = _matches_any_token(out["_internal_sort"], set(GROUP_B_NOTES))
+
+    # Bucket: 0 = Group A (Fulton set), 1 = Group B (DTF/DTFCE), 2 = other/invalid
+    out["_bucket"] = 2
+    out.loc[in_group_a, "_bucket"] = 0
+    out.loc[~in_group_a & in_group_b, "_bucket"] = 1
+
+    # Visual sort: A first, then B, then others; within each → Last, First, Phone, refunds last, time
+    sort_cols = ["_bucket", "_last_sort", "_first_sort", "_phone_sort", "_is_refund", "Pick Up Time"]
     out = out.sort_values(by=sort_cols, kind="stable", na_position="last").reset_index(drop=True)
 
-    # valid vs invalid internal notes (still needed for the invalid footer)
-    allowed = set(internal_note_values)
-    ic = out["_internal_sort"]
-    valid_mask = pd.Series(False, index=out.index)
-    for token in allowed:
-        valid_mask = valid_mask | ic.str.contains(rf"\b{token}\b", regex=True, na=False)
+    # Only A or B in main block; others go to "invalid" footer
+    valid_mask = out["_bucket"].isin([0, 1])
 
     # Hide helper columns from export
     show_cols = [c for c in out.columns if c not in [
         "_is_canceled", "_is_refund", "_internal_sort",
         "_first_sort", "_last_sort", "_phone_sort",
-        "_LNORM", "_FNORM", "_PNORM"
+        "_LNORM", "_FNORM", "_PNORM", "_bucket"
     ]]
 
     # refunds to show in footer (but KEEP them in main)
@@ -568,26 +588,18 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
         main_block["_PNORM"] = _collapse_ws_series(main_block["Rider Phone #"])
 
     # ---- Totals per rider (EXCLUDING refunds) ----
-    grp_keys = ["_LNORM", "_FNORM", "_PNORM"]
     if not main_block.empty:
         main_block["Total Trips"] = ""
-        grouped = main_block.groupby(grp_keys, sort=False, dropna=False)
+        grouped = main_block.groupby(["_LNORM","_FNORM","_PNORM"], sort=False, dropna=False)
         blocks = []
         show_cols_top = [c for c in show_cols if c != "Total Trips"] + ["Total Trips"]
 
-        for i, (key, g) in enumerate(grouped):
+        for i, (_, g) in enumerate(grouped):
             g = g.copy()
             non_refund_mask = ~g["_is_refund"]
             trip_count = int(non_refund_mask.sum())
-
-            # place total on the LAST NON-REFUND row; if none, place on last row
-            if non_refund_mask.any():
-                idx_place = g.loc[non_refund_mask].index.max()
-            else:
-                idx_place = g.index.max()
-
+            idx_place = g.loc[non_refund_mask].index.max() if non_refund_mask.any() else g.index.max()
             g.loc[idx_place, "Total Trips"] = trip_count
-
             blocks.append(g[show_cols_top])
             if i < len(grouped) - 1:
                 blocks.append(pd.DataFrame([{c: "" for c in show_cols_top}]))
@@ -596,7 +608,7 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     else:
         final_df = out[show_cols].iloc[0:0].copy()
 
-    # footer: invalid internal notes
+    # footer: invalid internal notes (anything outside A/B)
     out_invalid = out.loc[~valid_mask, show_cols].copy()
     if not out_invalid.empty:
         spacer_above = pd.concat([pd.DataFrame([{c: "" for c in show_cols}]) for _ in range(10)], ignore_index=True)
