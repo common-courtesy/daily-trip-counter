@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 from io import BytesIO
 import csv
+import re
 from openpyxl.styles import PatternFill, Border, Side
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -65,11 +66,9 @@ def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     # If only "Rider Name" exists, split into First/Last for grouping/sorting
     if "Rider Name" in df.columns and ("First Name" not in df.columns or "Last Name" not in df.columns):
         name_series = df["Rider Name"].fillna("").astype(str)
-        parts = name_series.str.strip().str.rsplit(" ", n=1)
-        df["First Name"] = parts.str[0].fillna("").str.strip()
-        df["Last Name"]  = parts.str[1].fillna("").str.strip()
-        one_token = ~name_series.str.contains(" ")
-        df.loc[one_token, "Last Name"] = ""
+        first_last = name_series.apply(_split_first_last)
+        df["First Name"] = first_last.apply(lambda x: x[0])
+        df["Last Name"]  = first_last.apply(lambda x: x[1])
 
     return df
 
@@ -175,7 +174,26 @@ def _ensure_daily_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-internal_note_values = ["FCC", "FCM", "FCSH", "FCSC", "DTF", "DTFCE"]
+internal_note_values = ["FCC", "FCM", "FCSH", "FCSC", "DTF", "DTFCE", "FCEX9", "FCEX10"]
+
+def _collapse_ws_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(object)
+         .fillna("")
+         .astype(str)
+         .str.replace(r"\s+", " ", regex=True)
+         .str.strip()
+    )
+
+def _split_first_last(full: str) -> tuple[str, str]:
+    full = re.sub(r"\s+", " ", str(full).strip())  # collapse internal spaces first
+    if not full:
+        return "", ""
+    parts = full.split(" ", 1)  # first token = first name, rest = last name
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0].strip(), parts[1].strip()
+
 
 def _coalesce_duplicate_columns(df: pd.DataFrame, only: list[str] | None = None) -> pd.DataFrame:
     """
@@ -333,8 +351,15 @@ def clean_file(uploaded_file):
 
         # Drop noisy columns
         custom_columns_to_hide = columns_to_hide.copy()
+
+        # Never drop 'Email' so Uber sheets keep it
+        if "Email" in custom_columns_to_hide:
+            custom_columns_to_hide.remove("Email")
+
+        # (keeps your special-case too; harmless now)
         if is_common_courtesy and "Email" in custom_columns_to_hide:
             custom_columns_to_hide.remove("Email")
+
         df = df.drop(columns=[c for c in custom_columns_to_hide if c in df.columns], errors="ignore")
 
         # Now define renames and apply them (do NOT use column_rename_map before this point)
@@ -347,6 +372,16 @@ def clean_file(uploaded_file):
             "Requester Email": "Email Info",
         }
         df.rename(columns=column_rename_map, inplace=True)
+
+        # Ensure Dispatcher Email is populated for Uber (and others)
+        if "Dispatcher Email" not in df.columns:
+            if "Email Info" in df.columns:
+                df["Dispatcher Email"] = df["Email Info"]
+            elif "Email" in df.columns:  # fallback if renames change later
+                df["Dispatcher Email"] = df["Email"]
+            elif "Requester Email" in df.columns:
+                df["Dispatcher Email"] = df["Requester Email"]
+
 
         # Make names unique in the cleaned view
         df = df.loc[:, ~df.columns.duplicated()]
@@ -361,6 +396,12 @@ def clean_file(uploaded_file):
         for c in ["First Name", "Last Name", "Passenger Number"]:
             if c in df.columns:
                 df[c] = df[c].fillna("").astype(str).str.strip()
+
+        # Collapse internal spaces so "J  HARRINGTON" == "J HARRINGTON"
+        for c in ["First Name", "Last Name", "Rider Name"]:
+            if c in df.columns:
+                df[c] = _collapse_ws_series(df[c])
+
 
         # 🔧 Normalize phone now so downstream is clean
         if "Passenger Number" in df.columns:
@@ -397,20 +438,30 @@ def _normalize_phone(s: pd.Series) -> pd.Series:
 
 def build_daily_trip_sheet(df, include_refunds_bottom=True):
     """
-    One row per trip. Totals exclude canceled-like rows (CANCELED/DRIVER_CANCELED/REFUND).
-    Totals appear only on the last non-canceled trip for each rider (or 0 on last row if all canceled).
-    Group/sort order: Internal Note -> First Name -> Last Name -> Rider Phone # -> refunds last -> time.
+    One row per trip.
+    - Drop any row where Trip Taken == 'x' (strictly by the rendered flag).
+    - Keep refunds (Trip Taken == '-') in the main block.
+    - If include_refunds_bottom is True, also list refunds again in a footer.
+    - Sort/group visually by Last → First → Phone → refunds last → time.  <-- (no Internal Note)
+    - Totals are computed per rider EXCLUDING refunds.
     """
     import numpy as np
     import pandas as pd
 
-    # choose a time column (prefer local)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[
+            "Pick up Date","Pick Up Time","First Name","Last Name","Rider Phone #",
+            "Pick Up Address","Drop Off Address","Pickup to Drop of Miles","Transaction Amount",
+            "Dispatcher Email","Internal Note","Transaction Type","Ride Status",
+            "Trip Taken","Notes","Total Trips"
+        ]).iloc[0:0]
+
+    df = df.copy()
+
+    # --- choose time/date columns ---
     time_cols = ["Pickup Time (Local)", "Request Time (Local)", "Pickup Time (UTC)", "Request Time (UTC)"]
     time_col = next((c for c in time_cols if c in df.columns), None)
-    df = df.copy()
     df["_TIME_"] = df[time_col].fillna("").astype(str).str.strip() if time_col else ""
-
-    # date column (optional)
     date_col = next((c for c in ["Pickup Date (Local)", "Request Date (Local)"] if c in df.columns), None)
     df["_DATE_"] = df[date_col].fillna("").astype(str).str.strip() if date_col else ""
 
@@ -419,44 +470,39 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     last  = df.get("Last Name",  pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
     if (first.eq("").all() and last.eq("").all()) and ("Rider Name" in df.columns):
         name_series = df["Rider Name"].fillna("").astype(str)
-        parts = name_series.str.strip().str.rsplit(" ", n=1)
-        first = parts.str[0].fillna("").str.strip()
-        last  = parts.str[1].fillna("").str.strip()
-        first = first.mask(first.eq(name_series), name_series)
-        last  = last.mask(first.eq(name_series), "")
+        first_last = name_series.apply(_split_first_last)  # keeps everything after first token as last name
+        first = first_last.apply(lambda x: x[0])
+        last  = first_last.apply(lambda x: x[1])
 
+    # --- phone ---
     phone = df.get("Passenger Number", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
     phone = _normalize_phone(phone)
 
-    # ---- status / refunds ----
+    # --- status/refund mapping (for Trip Taken) ---
     status_show = df.get("Ride Status", pd.Series([""] * len(df))).fillna("").astype(str).str.strip()
     amt_raw = df["Transaction Amount"] if "Transaction Amount" in df.columns else pd.Series([None] * len(df), index=df.index)
     amt_num = pd.to_numeric(pd.Series(amt_raw).astype(str).str.replace(r"[^\d\.\-]", "", regex=True), errors="coerce")
     refund_mask = amt_num.lt(0)
     status_show = status_show.mask(refund_mask, "REFUND")
-    is_canceled = _is_canceled_series(status_show) | refund_mask
+    is_canceled = _is_canceled_series(status_show) | refund_mask  # used only to create Trip Taken
 
-    # ---- extras ----
-    pickup_addr   = _col(df, "Pickup Address")
-    dropoff_addr  = _col(df, "Drop-off Address")
+    # --- extras ---
+    pickup_addr  = _col(df, "Pickup Address")
+    dropoff_addr = _col(df, "Drop-off Address")
     if "Pickup to Drop-off Miles" in df.columns:
         miles = _col(df, "Pickup to Drop-off Miles")
     elif "Distance (miles)" in df.columns:
         miles = _col(df, "Distance (miles)")
     else:
         miles = pd.Series([""] * len(df), index=df.index)
-    trans_amount  = _col(df, "Transaction Amount")
-    dispatcher    = _col(df, "Dispatcher Email")
+    trans_amount = _col(df, "Transaction Amount")
+    dispatcher   = _col(df, "Dispatcher Email")
+    internal_src = "Internal Code" if "Internal Code" in df.columns else ("Internal Note" if "Internal Note" in df.columns else None)
+    internal_vis = _col(df, internal_src) if internal_src else pd.Series([""] * len(df), index=df.index)
+    trans_type   = _col(df, "Transaction Type")
 
-    # Use whichever exists for the INTERNAL NOTE/CODE and keep that visible name as "Internal Note"
-    internal_source = "Internal Code" if "Internal Code" in df.columns else ("Internal Note" if "Internal Note" in df.columns else None)
-    internal_visible = _col(df, internal_source) if internal_source else pd.Series([""] * len(df), index=df.index)
-
-    trans_type    = _col(df, "Transaction Type")
-
-    # ---- output table ----
+    # --- assemble and HARD-FILTER canceled rows by Trip Taken flag ---
     trip_taken = np.select([refund_mask, is_canceled], ["-", "x"], default="✓")
-
     out = pd.DataFrame({
         "Pick up Date": df["_DATE_"],
         "Pick Up Time": df["_TIME_"],
@@ -468,7 +514,7 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
         "Pickup to Drop of Miles": miles,
         "Transaction Amount": trans_amount,
         "Dispatcher Email": dispatcher,
-        "Internal Note": internal_visible,   # show this label in the sheet
+        "Internal Note": internal_vis,
         "Transaction Type": trans_type,
         "Ride Status": status_show,
         "Trip Taken": trip_taken,
@@ -476,97 +522,96 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
         "Notes": ''
     })
 
-    # helpers for sorting / filtering
-    out["_is_refund"] = status_show.str.upper().eq("REFUND").values
+    # Normalize Trip Taken, filter canceled
+    tt_norm = out["Trip Taken"].astype(str).str.normalize("NFKC").str.strip().str.lower()
+    out = out.loc[~tt_norm.eq("x")].copy()      # ← drop all canceled rows
+
+    # Helper flags/keys
+    out["_is_refund"] = tt_norm.loc[out.index].eq("-").values
+
+    # (Still compute for validity check; not used in sorting)
     out["_internal_sort"] = out["Internal Note"].astype(str).str.upper().str.strip()
 
-    # ✅ sort/group: Internal Note → First → Last → Phone → refunds last → time
-    sort_cols = ["_internal_sort", "First Name", "Last Name", "Rider Phone #", "_is_refund", "Pick Up Time"]
+    # Normalized sort keys so "J  HARRINGTON" == "J HARRINGTON"
+    out["_first_sort"] = _collapse_ws_series(out["First Name"]).str.upper()
+    out["_last_sort"]  = _collapse_ws_series(out["Last Name"]).str.upper()
+    out["_phone_sort"] = _collapse_ws_series(out["Rider Phone #"])
+
+    # Visual sort (NO Internal Note): Last → First → Phone → refunds last → time
+    sort_cols = ["_last_sort", "_first_sort", "_phone_sort", "_is_refund", "Pick Up Time"]
     out = out.sort_values(by=sort_cols, kind="stable", na_position="last").reset_index(drop=True)
 
-    # --- split into VALID (top) vs INVALID (footer) by allowed internal note tokens ---
-    allowed = set(internal_note_values)  # {"FCC","FCM","FCSH","FCSC","DTF","DTFCE"}
-    ic = out["_internal_sort"]  # already upper/stripped
+    # valid vs invalid internal notes (still needed for the invalid footer)
+    allowed = set(internal_note_values)
+    ic = out["_internal_sort"]
     valid_mask = pd.Series(False, index=out.index)
     for token in allowed:
         valid_mask = valid_mask | ic.str.contains(rf"\b{token}\b", regex=True, na=False)
 
-    # Columns to show (hide helper columns)
-    show_cols = [c for c in out.columns if c not in ["_is_canceled", "_is_refund", "_internal_sort"]]
+    # Hide helper columns from export
+    show_cols = [c for c in out.columns if c not in [
+        "_is_canceled", "_is_refund", "_internal_sort",
+        "_first_sort", "_last_sort", "_phone_sort",
+        "_LNORM", "_FNORM", "_PNORM"
+    ]]
 
-    # Refund rows (for optional footer)
+    # refunds to show in footer (but KEEP them in main)
     refund_rows = out.loc[out["_is_refund"], show_cols].copy()
 
-    # Build TOP data from valid rows, with "Total Trips" on last non-canceled row per rider
-    out_valid = out.loc[valid_mask].copy()
-    grp_keys = ["Internal Note", "First Name", "Last Name", "Rider Phone #"]  # keep grouping by internal first
-    if not out_valid.empty:
-        totals_series = out_valid.loc[~out_valid["_is_canceled"]].groupby(grp_keys, dropna=False).size()
-        out_valid["Total Trips"] = ""
-        grouped = out_valid.groupby(grp_keys, sort=False, dropna=False)
+    # main block: keep EVERYTHING valid (refunds included)
+    main_block = out.loc[valid_mask].copy()
+
+    # Normalized keys for grouping/summing (space-collapsed, uppercased)
+    if not main_block.empty:
+        main_block["_LNORM"] = _collapse_ws_series(main_block["Last Name"]).str.upper()
+        main_block["_FNORM"] = _collapse_ws_series(main_block["First Name"]).str.upper()
+        main_block["_PNORM"] = _collapse_ws_series(main_block["Rider Phone #"])
+
+    # ---- Totals per rider (EXCLUDING refunds) ----
+    grp_keys = ["_LNORM", "_FNORM", "_PNORM"]
+    if not main_block.empty:
+        main_block["Total Trips"] = ""
+        grouped = main_block.groupby(grp_keys, sort=False, dropna=False)
         blocks = []
-        keys_list = list(grouped.groups.keys())
         show_cols_top = [c for c in show_cols if c != "Total Trips"] + ["Total Trips"]
 
-        for i, key in enumerate(keys_list):
-            g = grouped.get_group(key).copy()
-            g_nc = g.loc[~g["_is_canceled"]]
-            if len(g_nc) > 0:
-                idx_place = g_nc.index.max()
-                g.loc[idx_place, "Total Trips"] = int(totals_series.get(key, 0))
+        for i, (key, g) in enumerate(grouped):
+            g = g.copy()
+            non_refund_mask = ~g["_is_refund"]
+            trip_count = int(non_refund_mask.sum())
+
+            # place total on the LAST NON-REFUND row; if none, place on last row
+            if non_refund_mask.any():
+                idx_place = g.loc[non_refund_mask].index.max()
             else:
-                g.loc[g.index.max(), "Total Trips"] = 0
+                idx_place = g.index.max()
+
+            g.loc[idx_place, "Total Trips"] = trip_count
 
             blocks.append(g[show_cols_top])
-            if i < len(keys_list) - 1:
+            if i < len(grouped) - 1:
                 blocks.append(pd.DataFrame([{c: "" for c in show_cols_top}]))
 
         final_df = pd.concat(blocks, ignore_index=True).fillna("")
     else:
         final_df = out[show_cols].iloc[0:0].copy()
 
-    # --- Footer 1: INVALID internal notes (with spacing) ---
+    # footer: invalid internal notes
     out_invalid = out.loc[~valid_mask, show_cols].copy()
     if not out_invalid.empty:
         spacer_above = pd.concat([pd.DataFrame([{c: "" for c in show_cols}]) for _ in range(10)], ignore_index=True)
         title_invalid = pd.DataFrame([{c: "" for c in show_cols}])
         title_invalid.iloc[0, 0] = "Internal note is not Forsyth ,Fulton, or an incorrect interal note was added"
-
-        footer_blocks = []
-        footer_groups = out_invalid.groupby(grp_keys, dropna=False)
-        fkeys = list(footer_groups.groups.keys())
-        for i, k in enumerate(fkeys):
-            g = footer_groups.get_group(k)
-            footer_blocks.append(g)
-            if i < len(fkeys) - 1:
-                footer_blocks.append(pd.DataFrame([{c: "" for c in show_cols}]))
-
-        bad_rows_spaced = pd.concat(footer_blocks, ignore_index=True)
         spacer_below = pd.concat([pd.DataFrame([{c: "" for c in show_cols}]) for _ in range(10)], ignore_index=True)
-
-        final_df = pd.concat([final_df, spacer_above, title_invalid, bad_rows_spaced, spacer_below],
+        final_df = pd.concat([final_df, spacer_above, title_invalid, out_invalid, spacer_below],
                              ignore_index=True).fillna("")
 
-    # --- Footer 2: Refunds (optional) ---
+    # footer: refunds (duplicates on purpose)
     if include_refunds_bottom and not refund_rows.empty:
-        final_df = pd.concat([final_df, pd.DataFrame([{c: "" for c in show_cols}])],
-                             ignore_index=True)
-
+        final_df = pd.concat([final_df, pd.DataFrame([{c: "" for c in show_cols}])], ignore_index=True)
         title_refunds = pd.DataFrame([{c: "" for c in show_cols}])
         title_refunds.iloc[0, 0] = "Refunds"
-
-        r_blocks = []
-        r_groups = refund_rows.groupby(grp_keys, dropna=False)
-        rkeys = list(r_groups.groups.keys())
-        for i, k in enumerate(rkeys):
-            g = r_groups.get_group(k)
-            r_blocks.append(g)
-            if i < len(rkeys) - 1:
-                r_blocks.append(pd.DataFrame([{c: "" for c in show_cols}]))
-
-        refunds_spaced = pd.concat(r_blocks, ignore_index=True)
-        final_df = pd.concat([final_df, title_refunds, refunds_spaced],
-                             ignore_index=True).fillna("")
+        final_df = pd.concat([final_df, title_refunds, refund_rows], ignore_index=True).fillna("")
 
     return final_df
 
