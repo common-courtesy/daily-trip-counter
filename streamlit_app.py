@@ -177,7 +177,7 @@ def _ensure_daily_schema(df: pd.DataFrame) -> pd.DataFrame:
 internal_note_values = ["FCC", "FCM", "FCSH", "FCSC", "DTF", "DTFCE", "FCEX9", "FCEX10"]
 
 # Keep this where internal_note_values is defined
-GROUP_A_NOTES = {"FCC", "FCM", "FCSH", "FCSC", "FCEX9", "FCEX10"}
+GROUP_A_NOTES = {"FCC","FCM","FCSH","FCSC","FCEX9","FCEX09","FCEX10"}
 GROUP_B_NOTES = {"DTF", "DTFCE"}
 
 # Union used to validate internal notes (main-block vs invalid footer)
@@ -550,7 +550,9 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     def _matches_any_token(s: pd.Series, tokens: set[str]) -> pd.Series:
         if not tokens:
             return pd.Series(False, index=s.index)
-        pat = r"\b(" + "|".join(map(re.escape, sorted(tokens, key=len, reverse=True))) + r")\b"
+        # left boundary only (start or non-alnum), token may be followed by anything
+        tokens_sorted = sorted(tokens, key=len, reverse=True)
+        pat = r'(?<![A-Z0-9])(?:' + '|'.join(map(re.escape, tokens_sorted)) + r')'
         return s.str.contains(pat, regex=True, na=False)
 
     in_group_a = _matches_any_token(out["_internal_sort"], set(GROUP_A_NOTES))
