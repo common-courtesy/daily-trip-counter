@@ -747,9 +747,9 @@ include_refunds_bottom = st.checkbox(
 
 col1, col2 = st.columns(2)
 with col1:
-    uploaded_file_1 = st.file_uploader("File 1 (.xlsx or .csv)", type=["xlsx", "csv"], key="file_1")
+    uploaded_file_1 = st.file_uploader("Lyft File (.xlsx or .csv)", type=["xlsx", "csv"], key="file_1")
 with col2:
-    uploaded_file_2 = st.file_uploader("File 2 (.xlsx or .csv)", type=["xlsx", "csv"], key="file_2")
+    uploaded_file_2 = st.file_uploader("Uber File (.xlsx or .csv)", type=["xlsx", "csv"], key="file_2")
 
 # 🔽 Filter controls BEFORE the button
 all_notes = st.checkbox("Include all internal notes", value=True)
