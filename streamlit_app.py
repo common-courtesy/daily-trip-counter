@@ -174,10 +174,10 @@ def _ensure_daily_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
-internal_note_values = ["FCC", "FCM", "FCSH", "FCSC", "DTF", "DTFCE", "FCEX9", "FCEX10"]
+internal_note_values = ["FCC", "FCM", "FCSH", "FCSC", "DTF", "DTFCE", "FCEX9", "FCEX10", "FCE10"]
 
 # Keep this where internal_note_values is defined
-GROUP_A_NOTES = {"FCC","FCM","FCSH","FCSC","FCEX9","FCEX09","FCEX10"}
+GROUP_A_NOTES = {"FCC","FCM","FCSH","FCSC","FCEX9","FCEX09","FCEX10", "FCE10", "FCEX9"}
 GROUP_B_NOTES = {"DTF", "DTFCE"}
 
 # Union used to validate internal notes (main-block vs invalid footer)
@@ -444,20 +444,35 @@ def _normalize_phone(s: pd.Series) -> pd.Series:
     s = s.str.replace(r"^\+?1(?=\d{10}$)", "", regex=True)
     return s
 
-def build_daily_trip_sheet(df, include_refunds_bottom=True):
+def build_daily_trip_sheet(
+    df,
+    include_refunds_bottom=True,
+    internal_note_filter=None,   # str OR list[str]
+):
     """
-    One row per trip.
-    - Drop any row where Trip Taken == 'x' (strictly by the rendered flag).
-    - Keep refunds (Trip Taken == '-') in the main block (and optional footer).
-    - Sort/group visually by Bucket(A Fulton notes) → Bucket(B DTF/DTFCE) → Last → First → Phone → refunds last → time.
-    - Totals are computed per rider EXCLUDING refunds.
+    ... (docstring unchanged)
     """
     import numpy as np
     import pandas as pd
 
-    # Buckets are defined globally above:
-    # GROUP_A_NOTES = {"FCC","FCM","FCSH","FCSC","FCEX9","FCEX10"}
-    # GROUP_B_NOTES = {"DTF","DTFCE"}
+    # Normalize filter input to a set of uppercase strings.
+    # Accepts: None / "" / "All Internal Notes" (no filter) OR list of notes.
+    def _normalize_filter(filter_in):
+        if filter_in is None:
+            return set()  # empty set = no filter
+        if isinstance(filter_in, str):
+            token = filter_in.strip().upper()
+            if token in {"", "ALL", "ALL INTERNAL NOTES"}:
+                return set()
+            return {token}
+        # list/iterable case
+        try:
+            vals = {str(x).strip().upper() for x in filter_in if str(x).strip()}
+        except Exception:
+            vals = set()
+        return vals
+
+    selected_set = _normalize_filter(internal_note_filter)
 
     if df is None or df.empty:
         return pd.DataFrame(columns=[
@@ -466,6 +481,40 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
             "Dispatcher Email","Internal Note","Transaction Type","Ride Status",
             "Trip Taken","Notes","Total Trips"
         ]).iloc[0:0]
+
+    # -------- Optional Internal Note filter (applies to INPUT df) --------
+    if selected_set and "Internal Note" in df.columns:
+        s = df["Internal Note"].astype(str).str.strip().str.upper()
+        df = df.loc[s.isin(selected_set)].copy()
+        if df.empty:
+            return pd.DataFrame(columns=[
+                "Pick up Date","Pick Up Time","First Name","Last Name","Rider Phone #",
+                "Pick Up Address","Drop Off Address","Pickup to Drop of Miles","Transaction Amount",
+                "Dispatcher Email","Internal Note","Transaction Type","Ride Status",
+                "Trip Taken","Notes","Total Trips"
+            ]).iloc[0:0]
+
+    # ---- remainder of function stays the same ----
+    # (keep everything you already have below this point)
+
+    # -------- Optional Internal Note filter (applies to INPUT df) --------
+    if selected_set and "Internal Note" in df.columns:
+        s = df["Internal Note"].astype(str).str.strip().str.upper()
+        df = df.loc[s.isin(selected_set)].copy()
+        if df.empty:
+            return pd.DataFrame(columns=[
+                "Pick up Date","Pick Up Time","First Name","Last Name","Rider Phone #",
+                "Pick Up Address","Drop Off Address","Pickup to Drop of Miles","Transaction Amount",
+                "Dispatcher Email","Internal Note","Transaction Type","Ride Status",
+                "Trip Taken","Notes","Total Trips"
+            ]).iloc[0:0]
+
+
+    # ---- the rest of your original function (unchanged except for this header) ----
+
+    # Buckets are defined globally above:
+    # GROUP_A_NOTES = {"FCC","FCM","FCSH","FCSC","FCEX9","FCEX10"}
+    # GROUP_B_NOTES = {"DTF","DTFCE"}
 
     df = df.copy()
 
@@ -550,7 +599,6 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     def _matches_any_token(s: pd.Series, tokens: set[str]) -> pd.Series:
         if not tokens:
             return pd.Series(False, index=s.index)
-        # left boundary only (start or non-alnum), token may be followed by anything
         tokens_sorted = sorted(tokens, key=len, reverse=True)
         pat = r'(?<![A-Z0-9])(?:' + '|'.join(map(re.escape, tokens_sorted)) + r')'
         return s.str.contains(pat, regex=True, na=False)
@@ -563,7 +611,7 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     out.loc[in_group_a, "_bucket"] = 0
     out.loc[~in_group_a & in_group_b, "_bucket"] = 1
 
-    # Visual sort: A first, then B, then others; within each → Last, First, Phone, refunds last, time
+    # Visual sort
     sort_cols = ["_bucket", "_last_sort", "_first_sort", "_phone_sort", "_is_refund", "Pick Up Time"]
     out = out.sort_values(by=sort_cols, kind="stable", na_position="last").reset_index(drop=True)
 
@@ -580,7 +628,7 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
     # refunds to show in footer (but KEEP them in main)
     refund_rows = out.loc[out["_is_refund"], show_cols].copy()
 
-    # main block: keep EVERYTHING valid (refunds included)
+    # main block
     main_block = out.loc[valid_mask].copy()
 
     # Normalized keys for grouping/summing (space-collapsed, uppercased)
@@ -629,19 +677,16 @@ def build_daily_trip_sheet(df, include_refunds_bottom=True):
 
     return final_df
 
-def sort_and_merge(file1_obj, file2_obj):
+def sort_and_merge(file1_obj, file2_obj, internal_note_filter=None):  # str OR list[str]
     """
-    Use the same robust single-file cleaner for each file, then merge the
-    cleaned (minimal) DataFrames. This guarantees Common Courtesy / header
-    offsets, guest names, and renames are handled identically.
+    Clean each file with the same pipeline, merge, optionally filter by Internal Note,
+    then return the merged cleaned DataFrame.
     """
     import pandas as pd
 
-    # Clean both files with the SAME pipeline
     df1_clean, _ = clean_file(file1_obj)
     df2_clean, _ = clean_file(file2_obj)
 
-    # Guard against None
     if df1_clean is None:
         df1_clean = pd.DataFrame()
     if df2_clean is None:
@@ -649,18 +694,39 @@ def sort_and_merge(file1_obj, file2_obj):
 
     merged = pd.concat([df1_clean, df2_clean], ignore_index=True)
 
-    # Optional: trim basics again (harmless if already trimmed)
+    # Normalize filter to a set (same helper logic as above, inlined here)
+    def _normalize_filter(filter_in):
+        if filter_in is None:
+            return set()
+        if isinstance(filter_in, str):
+            token = filter_in.strip().upper()
+            if token in {"", "ALL", "ALL INTERNAL NOTES"}:
+                return set()
+            return {token}
+        try:
+            vals = {str(x).strip().upper() for x in filter_in if str(x).strip()}
+        except Exception:
+            vals = set()
+        return vals
+
+    selected_set = _normalize_filter(internal_note_filter)
+
+    # Optional Internal Note filter at the cleaned level
+    if selected_set and "Internal Note" in merged.columns:
+        s = merged["Internal Note"].astype(str).str.strip().str.upper()
+        merged = merged.loc[s.isin(selected_set)].copy()
+
+    # Tidy up (unchanged)
     for c in ["First Name", "Last Name", "Passenger Number"]:
         if c in merged.columns:
             merged[c] = merged[c].astype(str).str.strip()
 
-    # Stable sort for nicer grouping later
     sort_keys = [k for k in ["Last Name", "First Name", "Rider Phone #", "Pickup Time (Local)", "Request Time (Local)"] if k in merged.columns]
     if sort_keys:
         merged = merged.sort_values(by=sort_keys, kind="stable").reset_index(drop=True)
 
     return merged
-        
+
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="Daily Trip Counter", layout="centered")
@@ -685,6 +751,18 @@ with col1:
 with col2:
     uploaded_file_2 = st.file_uploader("File 2 (.xlsx or .csv)", type=["xlsx", "csv"], key="file_2")
 
+# 🔽 Filter controls BEFORE the button
+all_notes = st.checkbox("Include all internal notes", value=True)
+if all_notes:
+    internal_note_filter = []  # empty list → no filter
+else:
+    internal_note_filter = st.multiselect(
+        "Filter by Internal Note (choose one or many)",
+        options=internal_note_values,
+        default=[],  # or preselect a common subset if you like
+        help="Leave empty to include none; use the checkbox above to include all."
+    )
+
 run = st.button("🧹 Gather daily count file")
 
 if run:
@@ -698,24 +776,30 @@ if run:
 
         # CASE A: both files provided → merge cleaned + merge raw details
         if uploaded_file_1 and uploaded_file_2:
-            # Build merged minimal using your helper
-            merged_clean = sort_and_merge(uploaded_file_1, uploaded_file_2)
+            # Build merged minimal using your helper, honoring the dropdown filter
+            merged_clean = sort_and_merge(
+                uploaded_file_1,
+                uploaded_file_2,
+                internal_note_filter=internal_note_filter
+            )
 
             # Also build a merged RAW to feed the detail sheet (re-run clean_file to get raws)
             df1_clean, df1_raw = clean_file(uploaded_file_1)
             df2_clean, df2_raw = clean_file(uploaded_file_2)
-            if df1_raw is None:
-                import pandas as pd
-                df1_raw = pd.DataFrame()
-            if df2_raw is None:
-                import pandas as pd
-                df2_raw = pd.DataFrame()
-            import pandas as pd
-            merged_raw = pd.concat([df1_raw, df2_raw], ignore_index=True) if not df1_raw.empty or not df2_raw.empty else pd.DataFrame()
 
-            # Build the rider-only daily sheet from the merged minimal
-            rider_only_df = build_daily_trip_sheet(merged_clean, include_refunds_bottom=include_refunds_bottom)
-            # Build Uber detail from merged raw
+            import pandas as pd
+            # Avoid ambiguous truth-value on DataFrames
+            df1_raw = df1_raw if df1_raw is not None else pd.DataFrame()
+            df2_raw = df2_raw if df2_raw is not None else pd.DataFrame()
+            merged_raw = pd.concat([df1_raw, df2_raw], ignore_index=True) if (not df1_raw.empty or not df2_raw.empty) else pd.DataFrame()
+
+            # Build the rider-only daily sheet from the merged minimal (filtered)
+            rider_only_df = build_daily_trip_sheet(
+                merged_clean,
+                include_refunds_bottom=include_refunds_bottom,
+                internal_note_filter=internal_note_filter
+            )
+            # Build Uber detail from merged raw (unfiltered)
             uber_detail_df = build_uber_detail_sheet(merged_raw)
 
             out_filename = "daily_trips_merged.xlsx"
@@ -729,7 +813,11 @@ if run:
                 st.error("❌ Could not clean this file or it has no valid rows.")
                 st.stop()
 
-            rider_only_df = build_daily_trip_sheet(cleaned_df, include_refunds_bottom=include_refunds_bottom)
+            rider_only_df = build_daily_trip_sheet(
+                cleaned_df,
+                include_refunds_bottom=include_refunds_bottom,
+                internal_note_filter=internal_note_filter   # <-- use the dropdown selection
+            )
             uber_detail_df = build_uber_detail_sheet(raw_df)
             base = (single.name or "daily_trips").rsplit(".", 1)[0]
             out_filename = f"{base}_cleaned.xlsx"
@@ -747,8 +835,7 @@ if run:
             if rider_only_df is not None:
                 rider_only_df.to_excel(w, index=False, sheet_name="DailyTrips")
             if uber_detail_df is not None and not uber_detail_df.empty:
-                # Uncomment the next line if you want the Uber detail sheet included in the export
-                # (Your previous code had it commented out.)
+                # Uncomment if you want the Uber detail sheet included
                 # uber_detail_df.to_excel(w, index=False, sheet_name="UberDetail")
                 pass
         buf.seek(0)
