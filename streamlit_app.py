@@ -220,7 +220,7 @@ def _coalesce_duplicate_columns(df: pd.DataFrame, only: list[str] | None = None)
 
         # grab all duplicates of this name
         same_name_cols = [c for c in df.columns if c == name]
-        block = df[same_name_cols].astype(object).fillna("").astype(str).applymap(str.strip)
+        block = df[same_name_cols].astype(object).fillna("").astype(str).apply(lambda x: x.str.strip())
 
         # row-wise: first non-empty wins
         merged = block.apply(lambda row: next((v for v in row if v != ""), ""), axis=1)
@@ -660,7 +660,7 @@ def build_daily_trip_sheet(
             non_refund_mask = ~g["_is_refund"]
             trip_count = int(non_refund_mask.sum())
             idx_place = g.loc[non_refund_mask].index.max() if non_refund_mask.any() else g.index.max()
-            g.loc[idx_place, "Total Trips"] = trip_count
+            g.loc[idx_place, "Total Trips"] = str(trip_count)
             blocks.append(g[show_cols_top])
             if i < len(grouped) - 1:
                 blocks.append(pd.DataFrame([{c: "" for c in show_cols_top}]))
