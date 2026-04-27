@@ -623,8 +623,14 @@ def build_daily_trip_sheet(
         "Notes": ''
     })
 
-    # Normalize Trip Taken, filter canceled
+    # Normalize Trip Taken
     tt_norm = out["Trip Taken"].astype(str).str.normalize("NFKC").str.strip().str.lower()
+
+    # Capture canceled rows BEFORE we hard-filter them out, so we can rebuild a
+    # "Cancelled Trips" section at the bottom of the export.
+    canceled_block_src = out.loc[tt_norm.eq("x")].copy()
+
+    # Hard-filter canceled rows out of the main pipeline
     out = out.loc[~tt_norm.eq("x")].copy()
 
     # Helper flags/keys
@@ -720,6 +726,56 @@ def build_daily_trip_sheet(
         title_refunds = pd.DataFrame([{c: "" for c in show_cols}])
         title_refunds.iloc[0, 0] = "Refunds"
         final_df = pd.concat([final_df, title_refunds, refund_rows], ignore_index=True).fillna("")
+
+    # ---- footer: Cancelled Trips (sorted, grouped, with per-rider count) ----
+    if not canceled_block_src.empty:
+        cb = canceled_block_src.copy()
+
+        # Build the same sort/grouping keys as the main block
+        cb["_first_sort"] = _collapse_ws_series(cb["First Name"]).str.upper()
+        cb["_last_sort"]  = _collapse_ws_series(cb["Last Name"]).str.upper()
+        cb["_phone_sort"] = _collapse_ws_series(cb["Rider Phone #"])
+
+        # Sort: by Last, First, Phone, then time
+        cb = cb.sort_values(
+            by=["_last_sort", "_first_sort", "_phone_sort", "Pick Up Time"],
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+        # Same visible columns as main, plus a "Cancelled Trips" count column
+        cancel_show_cols = [c for c in show_cols if c != "Total Trips"] + ["Cancelled Trips"]
+
+        # Add the count column up front as object dtype
+        cb["Cancelled Trips"] = pd.Series([""] * len(cb), index=cb.index, dtype=object)
+
+        # Normalized grouping keys
+        cb["_LNORM"] = cb["_last_sort"]
+        cb["_FNORM"] = cb["_first_sort"]
+        cb["_PNORM"] = cb["_phone_sort"]
+
+        grouped_c = cb.groupby(["_LNORM", "_FNORM", "_PNORM"], sort=False, dropna=False)
+        cancel_blocks = []
+        for i, (_, g) in enumerate(grouped_c):
+            g = g.copy()
+            g["Cancelled Trips"] = g["Cancelled Trips"].astype(object)
+            cancel_count = int(len(g))
+            idx_place = g.index.max()
+            g.loc[idx_place, "Cancelled Trips"] = str(cancel_count)
+            cancel_blocks.append(g[cancel_show_cols])
+            if i < len(grouped_c) - 1:
+                cancel_blocks.append(pd.DataFrame([{c: "" for c in cancel_show_cols}]))
+
+        cancel_body = pd.concat(cancel_blocks, ignore_index=True).fillna("")
+
+        # Title row uses the SAME columns as the main export so concat aligns cleanly
+        # (extra "Cancelled Trips" column gets reconciled by concat)
+        spacer = pd.DataFrame([{c: "" for c in show_cols}])
+        title_cancel = pd.DataFrame([{c: "" for c in show_cols}])
+        title_cancel.iloc[0, 0] = "Cancelled Trips"
+
+        final_df = pd.concat([final_df, spacer, title_cancel, cancel_body],
+                             ignore_index=True).fillna("")
 
     return final_df
 
