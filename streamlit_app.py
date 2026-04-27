@@ -220,7 +220,8 @@ def _coalesce_duplicate_columns(df: pd.DataFrame, only: list[str] | None = None)
 
         # grab all duplicates of this name
         same_name_cols = [c for c in df.columns if c == name]
-        block = df[same_name_cols].astype(object).fillna("").astype(str).applymap(str.strip)
+        # NOTE: DataFrame.applymap was removed in pandas 2.1+. Use DataFrame.map instead.
+        block = df[same_name_cols].astype(object).fillna("").astype(str).map(str.strip)
 
         # row-wise: first non-empty wins
         merged = block.apply(lambda row: next((v for v in row if v != ""), ""), axis=1)
@@ -430,7 +431,14 @@ def clean_file(uploaded_file):
 
 
     except Exception as e:
+        # Surface the real traceback so silent failures don't happen again.
+        import traceback
+        traceback.print_exc()
         print("Error:", e)
+        try:
+            st.exception(e)
+        except Exception:
+            pass
         return None, None
 
 def _normalize_phone(s: pd.Series) -> pd.Series:
