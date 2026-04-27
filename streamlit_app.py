@@ -263,11 +263,23 @@ def _is_canceled_series(status_col: pd.Series) -> pd.Series:
     return squeezed.isin(canceled_tokens) | s.str.contains("CANCEL", na=False)
 
 def detect_header(uploaded_file):
+    """
+    Detect the row index where the real headers live.
+    Works for both CSV and Excel files (Common Courtesy / Uber exports
+    sometimes prepend banner rows above the actual headers).
+    """
+    name = (getattr(uploaded_file, "name", "") or "").lower()
+    is_excel = name.endswith(".xlsx") or name.endswith(".xls")
+
     uploaded_file.seek(0)
-    for idx in [0, 4, 5]:
+    for idx in [0, 4, 5, 6]:
         try:
-            df = pd.read_csv(uploaded_file, header=idx, nrows=1)
-            if any("trip/eats id" in col.lower() for col in df.columns):
+            if is_excel:
+                df = pd.read_excel(uploaded_file, header=idx, nrows=1)
+            else:
+                df = pd.read_csv(uploaded_file, header=idx, nrows=1)
+            cols_lc = [str(c).lower() for c in df.columns]
+            if any("trip/eats id" in c for c in cols_lc):
                 uploaded_file.seek(0)
                 print('I found the headers on index:', idx)
                 return idx
@@ -345,8 +357,29 @@ def clean_file(uploaded_file):
             df.columns = df.columns.str.replace('\ufeff', '', regex=False).str.strip()
 
         else:
-            # (xlsx branch unchanged)
-            df = pd.read_excel(uploaded_file)
+            # xlsx branch: also handle Uber/Common-Courtesy banner rows.
+            # Peek at the first 8 rows with no header to detect a "Common Courtesy"
+            # banner; if present, find the real header row the same way we do for CSV.
+            peek = pd.read_excel(uploaded_file, header=None, nrows=8, dtype=str).fillna("")
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            has_common_courtesy = peek.apply(
+                lambda r: r.astype(str).str.contains("common courtesy", case=False, na=False)
+            ).any().any()
+
+            if has_common_courtesy:
+                header_row = detect_header(uploaded_file)
+                try:
+                    uploaded_file.seek(0)
+                except Exception:
+                    pass
+                df = pd.read_excel(uploaded_file, header=header_row if header_row is not None else 5)
+                is_common_courtesy = True
+            else:
+                df = pd.read_excel(uploaded_file)
+
             df.columns = df.columns.str.replace('\ufeff', '', regex=False).str.strip()
 
         # Normalize headers
