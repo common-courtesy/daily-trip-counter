@@ -647,17 +647,22 @@ def build_daily_trip_sheet(
 
     # ---- Totals per rider (EXCLUDING refunds) ----
     if not main_block.empty:
-        main_block["Total Trips"] = ""
+        # Force object dtype so we can mix "" and integers without pandas
+        # locking the column into a strict string dtype.
+        main_block["Total Trips"] = pd.Series([""] * len(main_block), index=main_block.index, dtype=object)
         grouped = main_block.groupby(["_LNORM","_FNORM","_PNORM"], sort=False, dropna=False)
         blocks = []
         show_cols_top = [c for c in show_cols if c != "Total Trips"] + ["Total Trips"]
 
         for i, (_, g) in enumerate(grouped):
             g = g.copy()
+            # Re-assert object dtype on the per-group copy as well.
+            g["Total Trips"] = g["Total Trips"].astype(object)
             non_refund_mask = ~g["_is_refund"]
             trip_count = int(non_refund_mask.sum())
             idx_place = g.loc[non_refund_mask].index.max() if non_refund_mask.any() else g.index.max()
-            g.loc[idx_place, "Total Trips"] = trip_count
+            # Cast to str so the value is compatible with either string or object dtype.
+            g.loc[idx_place, "Total Trips"] = str(trip_count)
             blocks.append(g[show_cols_top])
             if i < len(grouped) - 1:
                 blocks.append(pd.DataFrame([{c: "" for c in show_cols_top}]))
