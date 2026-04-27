@@ -220,7 +220,7 @@ def _coalesce_duplicate_columns(df: pd.DataFrame, only: list[str] | None = None)
 
         # grab all duplicates of this name
         same_name_cols = [c for c in df.columns if c == name]
-        block = df[same_name_cols].astype(object).fillna("").astype(str).apply(lambda x: x.str.strip())
+        block = df[same_name_cols].astype(object).fillna("").astype(str).applymap(str.strip)
 
         # row-wise: first non-empty wins
         merged = block.apply(lambda row: next((v for v in row if v != ""), ""), axis=1)
@@ -370,13 +370,6 @@ def clean_file(uploaded_file):
 
         df = df.drop(columns=[c for c in custom_columns_to_hide if c in df.columns], errors="ignore")
 
-        # ✅ FIX: Combine Email variants BEFORE renaming to avoid duplicate "Email Info" columns.
-        #    When the file has both "Email" and "Requester Email", renaming both to "Email Info"
-        #    creates duplicate columns that break the Dispatcher Email assignment downstream.
-        if "Email" in df.columns and "Requester Email" in df.columns:
-            df["Email"] = df["Email"].combine_first(df["Requester Email"])
-            df.drop(columns=["Requester Email"], inplace=True)
-
         # Now define renames and apply them (do NOT use column_rename_map before this point)
         column_rename_map = {
             "Distance (mi)": "Distance (miles)",
@@ -387,10 +380,6 @@ def clean_file(uploaded_file):
             "Requester Email": "Email Info",
         }
         df.rename(columns=column_rename_map, inplace=True)
-
-        # ✅ FIX: Deduplicate columns immediately after rename (safety net for any
-        #    other column pairs that might collide after renaming).
-        df = df.loc[:, ~df.columns.duplicated()]
 
         # Ensure Dispatcher Email is populated for Uber (and others)
         if "Dispatcher Email" not in df.columns:
@@ -660,7 +649,7 @@ def build_daily_trip_sheet(
             non_refund_mask = ~g["_is_refund"]
             trip_count = int(non_refund_mask.sum())
             idx_place = g.loc[non_refund_mask].index.max() if non_refund_mask.any() else g.index.max()
-            g.loc[idx_place, "Total Trips"] = str(trip_count)
+            g.loc[idx_place, "Total Trips"] = trip_count
             blocks.append(g[show_cols_top])
             if i < len(grouped) - 1:
                 blocks.append(pd.DataFrame([{c: "" for c in show_cols_top}]))
@@ -753,7 +742,7 @@ highlight_refunds = st.toggle(
 include_refunds_bottom = st.checkbox(
     "Include Refunds at Bottom",
     value=True,
-    help="When checked, refund rows are removed from the main table and listed in a footer section titled 'Refunds'."
+    help="When checked, refund rows are removed from the main table and listed in a footer section titled ‘Refunds’."
 )
 
 col1, col2 = st.columns(2)
