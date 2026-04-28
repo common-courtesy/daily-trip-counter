@@ -404,6 +404,15 @@ def clean_file(uploaded_file):
 
         df = df.drop(columns=[c for c in custom_columns_to_hide if c in df.columns], errors="ignore")
 
+        # Coalesce Email + Requester Email into a single column BEFORE the rename map
+        # runs. Otherwise the rename map below would map both names to "Email Info",
+        # creating duplicate columns and breaking the Dispatcher Email assignment.
+        if "Email" in df.columns and "Requester Email" in df.columns:
+            email_a = df["Email"].astype(object).fillna("").astype(str).str.strip()
+            email_b = df["Requester Email"].astype(object).fillna("").astype(str).str.strip()
+            df["Email Info"] = email_a.where(email_a != "", email_b)
+            df = df.drop(columns=["Email", "Requester Email"])
+
         # Now define renames and apply them (do NOT use column_rename_map before this point)
         column_rename_map = {
             "Distance (mi)": "Distance (miles)",
