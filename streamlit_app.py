@@ -735,14 +735,43 @@ def build_daily_trip_sheet(
     else:
         final_df = out[show_cols].iloc[0:0].copy()
 
-    # footer: invalid internal notes (anything outside A/B)
+    # footer: invalid internal notes (anything outside A/B). Sort + group by
+    # rider with spacer rows between riders, same pattern as the other footers.
     out_invalid = out.loc[~valid_mask, show_cols].copy()
     if not out_invalid.empty:
+        ib = out_invalid.copy()
+
+        # Build the same sort/grouping keys as the main block
+        ib["_first_sort"] = _collapse_ws_series(ib["First Name"]).str.upper()
+        ib["_last_sort"]  = _collapse_ws_series(ib["Last Name"]).str.upper()
+        ib["_phone_sort"] = _collapse_ws_series(ib["Rider Phone #"])
+
+        # Sort: by Last, First, Phone, then time
+        ib = ib.sort_values(
+            by=["_last_sort", "_first_sort", "_phone_sort", "Pick Up Time"],
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+        # Normalized grouping keys
+        ib["_LNORM"] = ib["_last_sort"]
+        ib["_FNORM"] = ib["_first_sort"]
+        ib["_PNORM"] = ib["_phone_sort"]
+
+        grouped_i = ib.groupby(["_LNORM", "_FNORM", "_PNORM"], sort=False, dropna=False)
+        invalid_blocks = []
+        for i, (_, g) in enumerate(grouped_i):
+            invalid_blocks.append(g[show_cols])
+            if i < len(grouped_i) - 1:
+                invalid_blocks.append(pd.DataFrame([{c: "" for c in show_cols}]))
+
+        invalid_body = pd.concat(invalid_blocks, ignore_index=True).fillna("")
+
         spacer_above = pd.concat([pd.DataFrame([{c: "" for c in show_cols}]) for _ in range(10)], ignore_index=True)
         title_invalid = pd.DataFrame([{c: "" for c in show_cols}])
         title_invalid.iloc[0, 0] = "Internal note is not Forsyth ,Fulton, or an incorrect interal note was added"
         spacer_below = pd.concat([pd.DataFrame([{c: "" for c in show_cols}]) for _ in range(10)], ignore_index=True)
-        final_df = pd.concat([final_df, spacer_above, title_invalid, out_invalid, spacer_below],
+        final_df = pd.concat([final_df, spacer_above, title_invalid, invalid_body, spacer_below],
                              ignore_index=True).fillna("")
 
     # footer: refunds (duplicates on purpose). Sort + group by rider with
