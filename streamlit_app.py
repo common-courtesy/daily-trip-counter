@@ -593,6 +593,22 @@ def build_daily_trip_sheet(
     amt_raw = df["Transaction Amount"] if "Transaction Amount" in df.columns else pd.Series([None] * len(df), index=df.index)
     amt_num = pd.to_numeric(pd.Series(amt_raw).astype(str).str.replace(r"[^\d\.\-]", "", regex=True), errors="coerce")
     refund_mask = amt_num.lt(0)
+
+    # Some Lyft exports (transaction reports) have no Ride Status column.
+    # In those files, cancellations are encoded in Transaction Type instead
+    # ("Cancel" / "Refund" / "Ride" / "Additional Charge"). Detect that here
+    # and synthesize a Ride Status so the rest of the pipeline can treat them
+    # the same as files that do have Ride Status.
+    if "Transaction Type" in df.columns:
+        ttype_norm = df["Transaction Type"].fillna("").astype(str).str.strip().str.upper()
+        tt_cancel_mask = ttype_norm.eq("CANCEL") | ttype_norm.str.contains("CANCEL", na=False)
+        tt_refund_mask = ttype_norm.eq("REFUND")
+        # Promote those into status_show so downstream cancel/refund logic catches them.
+        status_show = status_show.mask(tt_cancel_mask & status_show.eq(""), "Cancelled")
+        status_show = status_show.mask(tt_refund_mask & status_show.eq(""), "REFUND")
+        # Also fold the Transaction Type refunds into the refund mask
+        refund_mask = refund_mask | tt_refund_mask
+
     status_show = status_show.mask(refund_mask, "REFUND")
     is_canceled = _is_canceled_series(status_show) | refund_mask
 
