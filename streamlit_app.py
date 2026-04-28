@@ -745,12 +745,42 @@ def build_daily_trip_sheet(
         final_df = pd.concat([final_df, spacer_above, title_invalid, out_invalid, spacer_below],
                              ignore_index=True).fillna("")
 
-    # footer: refunds (duplicates on purpose)
+    # footer: refunds (duplicates on purpose). Sort + group by rider with
+    # spacer rows between riders, same pattern as the Cancelled Trips footer.
     if include_refunds_bottom and not refund_rows.empty:
-        final_df = pd.concat([final_df, pd.DataFrame([{c: "" for c in show_cols}])], ignore_index=True)
+        rb = refund_rows.copy()
+
+        # Build the same sort/grouping keys as the main block
+        rb["_first_sort"] = _collapse_ws_series(rb["First Name"]).str.upper()
+        rb["_last_sort"]  = _collapse_ws_series(rb["Last Name"]).str.upper()
+        rb["_phone_sort"] = _collapse_ws_series(rb["Rider Phone #"])
+
+        # Sort: by Last, First, Phone, then time
+        rb = rb.sort_values(
+            by=["_last_sort", "_first_sort", "_phone_sort", "Pick Up Time"],
+            kind="stable",
+            na_position="last",
+        ).reset_index(drop=True)
+
+        # Normalized grouping keys
+        rb["_LNORM"] = rb["_last_sort"]
+        rb["_FNORM"] = rb["_first_sort"]
+        rb["_PNORM"] = rb["_phone_sort"]
+
+        grouped_r = rb.groupby(["_LNORM", "_FNORM", "_PNORM"], sort=False, dropna=False)
+        refund_blocks = []
+        for i, (_, g) in enumerate(grouped_r):
+            refund_blocks.append(g[show_cols])
+            if i < len(grouped_r) - 1:
+                refund_blocks.append(pd.DataFrame([{c: "" for c in show_cols}]))
+
+        refund_body = pd.concat(refund_blocks, ignore_index=True).fillna("")
+
+        spacer = pd.DataFrame([{c: "" for c in show_cols}])
         title_refunds = pd.DataFrame([{c: "" for c in show_cols}])
         title_refunds.iloc[0, 0] = "Refunds"
-        final_df = pd.concat([final_df, title_refunds, refund_rows], ignore_index=True).fillna("")
+        final_df = pd.concat([final_df, spacer, title_refunds, refund_body],
+                             ignore_index=True).fillna("")
 
     # ---- footer: Cancelled Trips (sorted, grouped, with per-rider count) ----
     if not canceled_block_src.empty:
