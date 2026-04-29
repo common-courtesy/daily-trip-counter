@@ -1083,7 +1083,7 @@ st.markdown("---")
 # ============================================================
 # SECTION 2 — Combine two files & split by internal notes
 # ============================================================
-st.markdown("## 📎 Combine Two Filtered Files & Split by Internal Notes")
+st.markdown("## 📎 Combine Two Filtered Files")
 
 uploaded_file_1 = st.file_uploader(
     "Upload your first .xlsx or .csv file",
