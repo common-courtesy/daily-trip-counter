@@ -914,30 +914,118 @@ def sort_and_merge(file1_obj, file2_obj, internal_note_filter=None):  # str OR l
     return merged
 
 
-# --- Streamlit UI ---
+# ============================================================
+#                       Streamlit UI
+# ============================================================
 st.set_page_config(page_title="Daily Trip Counter", layout="centered")
 st.title("📊 Daily Trip Counter")
 
-# Controls
+
+def _run_pipeline(file1, file2, highlight_refunds, include_refunds_bottom, internal_note_filter):
+    """
+    Shared pipeline used by BOTH the single-upload section and the
+    combine-two-files section. Builds the cleaned daily-trip sheet,
+    optionally highlights refunds, and returns (buffer, filename).
+    """
+    rider_only_df = None
+    uber_detail_df = None
+    out_filename = "daily_trips.xlsx"
+
+    # CASE A: both files provided → merge cleaned + merge raw details
+    if file1 and file2:
+        merged_clean = sort_and_merge(
+            file1,
+            file2,
+            internal_note_filter=internal_note_filter,
+        )
+
+        df1_clean, df1_raw = clean_file(file1)
+        df2_clean, df2_raw = clean_file(file2)
+
+        df1_raw = df1_raw if df1_raw is not None else pd.DataFrame()
+        df2_raw = df2_raw if df2_raw is not None else pd.DataFrame()
+        merged_raw = (
+            pd.concat([df1_raw, df2_raw], ignore_index=True)
+            if (not df1_raw.empty or not df2_raw.empty)
+            else pd.DataFrame()
+        )
+
+        rider_only_df = build_daily_trip_sheet(
+            merged_clean,
+            include_refunds_bottom=include_refunds_bottom,
+            internal_note_filter=internal_note_filter,
+        )
+        uber_detail_df = build_uber_detail_sheet(merged_raw)
+        out_filename = "daily_trips_merged.xlsx"
+
+    # CASE B: only one file present → clean that one
+    else:
+        single = file1 if file1 else file2
+        cleaned_df, raw_df = clean_file(single)
+
+        if cleaned_df is None or cleaned_df.empty:
+            return None, None, "no_data"
+
+        rider_only_df = build_daily_trip_sheet(
+            cleaned_df,
+            include_refunds_bottom=include_refunds_bottom,
+            internal_note_filter=internal_note_filter,
+        )
+        uber_detail_df = build_uber_detail_sheet(raw_df)
+        base = (single.name or "daily_trips").rsplit(".", 1)[0]
+        out_filename = f"{base}_cleaned.xlsx"
+
+    # ---- Build workbook buffer ----
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        if rider_only_df is not None:
+            rider_only_df.to_excel(w, index=False, sheet_name="DailyTrips")
+        if uber_detail_df is not None and not uber_detail_df.empty:
+            # Uncomment if you want the Uber detail sheet included
+            # uber_detail_df.to_excel(w, index=False, sheet_name="UberDetail")
+            pass
+    buf.seek(0)
+
+    # --- Apply yellow highlight to refund rows if toggled ON ---
+    if highlight_refunds and rider_only_df is not None and not rider_only_df.empty:
+        amt_num = pd.to_numeric(
+            rider_only_df["Transaction Amount"].astype(str).str.replace(r"[^\d\.\-]", "", regex=True),
+            errors="coerce",
+        )
+        refund_mask = rider_only_df["Trip Taken"].astype(str).eq("-") | amt_num.lt(0)
+
+        if refund_mask.any():
+            wb = load_workbook(buf)
+            ws = wb["DailyTrips"]
+            fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+            rows_to_color = (refund_mask[refund_mask].index + 2).tolist()
+            max_col = ws.max_column
+            for r in rows_to_color:
+                for c in range(1, max_col + 1):
+                    ws[f"{get_column_letter(c)}{r}"].fill = fill
+            buf = BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+
+    return buf, out_filename, rider_only_df
+
+
+# ---------- Shared controls (apply to both sections) ----------
+st.write("Upload your Excel or CSV file to clean and summarize your data.")
+
 highlight_refunds = st.toggle(
     "Highlight refund rows (yellow)",
     value=False,
-    help="When on, any row with a refund will be highlighted in yellow in the export."
+    help="When on, any row with a refund will be highlighted in yellow in the export.",
 )
 
 include_refunds_bottom = st.checkbox(
     "Include Refunds at Bottom",
     value=True,
-    help="When checked, refund rows are removed from the main table and listed in a footer section titled ‘Refunds’."
+    help="When checked, refund rows are removed from the main table and listed in a footer section titled 'Refunds'.",
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    uploaded_file_1 = st.file_uploader("Lyft File (.xlsx or .csv)", type=["xlsx", "csv"], key="file_1")
-with col2:
-    uploaded_file_2 = st.file_uploader("Uber File (.xlsx or .csv)", type=["xlsx", "csv"], key="file_2")
-
-# 🔽 Filter controls BEFORE the button
+# 🔽 Filter controls (shared by both sections)
 all_notes = st.checkbox("Include all internal notes", value=True)
 if all_notes:
     internal_note_filter = []  # empty list → no filter
@@ -945,121 +1033,96 @@ else:
     internal_note_filter = st.multiselect(
         "Filter by Internal Note (choose one or many)",
         options=internal_note_values,
-        default=[],  # or preselect a common subset if you like
-        help="Leave empty to include none; use the checkbox above to include all."
+        default=[],
+        help="Leave empty to include none; use the checkbox above to include all.",
     )
 
-run = st.button("🧹 Gather daily count file")
+st.markdown("---")
 
-if run:
+# ============================================================
+# SECTION 1 — Single file upload
+# ============================================================
+single_file = st.file_uploader(
+    "Upload .xlsx or .csv file",
+    type=["xlsx", "csv"],
+    key="single_file",
+)
+
+run_single = st.button("🧹 Gather daily count file", key="run_single")
+
+if run_single:
+    if not single_file:
+        st.warning("Please upload a file.")
+    else:
+        buf, out_filename, rider_only_df = _run_pipeline(
+            file1=single_file,
+            file2=None,
+            highlight_refunds=highlight_refunds,
+            include_refunds_bottom=include_refunds_bottom,
+            internal_note_filter=internal_note_filter,
+        )
+        if buf is None:
+            st.error("❌ Could not clean this file or it has no valid rows.")
+        else:
+            if rider_only_df is None or rider_only_df.empty:
+                st.info("No trips found.")
+            else:
+                st.success("✅ Sheet ready.")
+                st.dataframe(rider_only_df.head(50))
+
+            st.download_button(
+                "📥 Download",
+                buf,
+                file_name=out_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_single",
+            )
+
+st.markdown("---")
+
+# ============================================================
+# SECTION 2 — Combine two files & split by internal notes
+# ============================================================
+st.markdown("## 📎 Combine Two Filtered Files & Split by Internal Notes")
+
+uploaded_file_1 = st.file_uploader(
+    "Upload your first .xlsx or .csv file",
+    type=["xlsx", "csv"],
+    key="file_1",
+)
+
+uploaded_file_2 = st.file_uploader(
+    "Upload your second .xlsx or .csv file",
+    type=["xlsx", "csv"],
+    key="file_2",
+)
+
+run_combine = st.button("🧹 Gather daily count file", key="run_combine")
+
+if run_combine:
     if not uploaded_file_1 and not uploaded_file_2:
         st.warning("Please upload at least one file.")
     else:
-        # We may need both the cleaned (minimal) df and the raw df
-        rider_only_df = None
-        uber_detail_df = None
-        out_filename = "daily_trips.xlsx"
-
-        # CASE A: both files provided → merge cleaned + merge raw details
-        if uploaded_file_1 and uploaded_file_2:
-            # Build merged minimal using your helper, honoring the dropdown filter
-            merged_clean = sort_and_merge(
-                uploaded_file_1,
-                uploaded_file_2,
-                internal_note_filter=internal_note_filter
-            )
-
-            # Also build a merged RAW to feed the detail sheet (re-run clean_file to get raws)
-            df1_clean, df1_raw = clean_file(uploaded_file_1)
-            df2_clean, df2_raw = clean_file(uploaded_file_2)
-
-            import pandas as pd
-            # Avoid ambiguous truth-value on DataFrames
-            df1_raw = df1_raw if df1_raw is not None else pd.DataFrame()
-            df2_raw = df2_raw if df2_raw is not None else pd.DataFrame()
-            merged_raw = pd.concat([df1_raw, df2_raw], ignore_index=True) if (not df1_raw.empty or not df2_raw.empty) else pd.DataFrame()
-
-            # Build the rider-only daily sheet from the merged minimal (filtered)
-            rider_only_df = build_daily_trip_sheet(
-                merged_clean,
-                include_refunds_bottom=include_refunds_bottom,
-                internal_note_filter=internal_note_filter
-            )
-            # Build Uber detail from merged raw (unfiltered)
-            uber_detail_df = build_uber_detail_sheet(merged_raw)
-
-            out_filename = "daily_trips_merged.xlsx"
-
-        # CASE B: only one file present → clean that one
-        else:
-            single = uploaded_file_1 if uploaded_file_1 else uploaded_file_2
-            cleaned_df, raw_df = clean_file(single)
-
-            if cleaned_df is None or cleaned_df.empty:
-                st.error("❌ Could not clean this file or it has no valid rows.")
-                st.stop()
-
-            rider_only_df = build_daily_trip_sheet(
-                cleaned_df,
-                include_refunds_bottom=include_refunds_bottom,
-                internal_note_filter=internal_note_filter   # <-- use the dropdown selection
-            )
-            uber_detail_df = build_uber_detail_sheet(raw_df)
-            base = (single.name or "daily_trips").rsplit(".", 1)[0]
-            out_filename = f"{base}_cleaned.xlsx"
-
-        # ---- Display + Download ----
-        if (rider_only_df is None or rider_only_df.empty) and (uber_detail_df is None or uber_detail_df.empty):
-            st.info("No trips found.")
-        else:
-            st.success("✅ Sheets ready.")
-            st.dataframe(rider_only_df.head(50) if rider_only_df is not None else None)
-
-        # Build workbook buffer
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            if rider_only_df is not None:
-                rider_only_df.to_excel(w, index=False, sheet_name="DailyTrips")
-            if uber_detail_df is not None and not uber_detail_df.empty:
-                # Uncomment if you want the Uber detail sheet included
-                # uber_detail_df.to_excel(w, index=False, sheet_name="UberDetail")
-                pass
-        buf.seek(0)
-
-        # --- Apply yellow highlight to refund rows if toggled ON ---
-        if highlight_refunds and rider_only_df is not None and not rider_only_df.empty:
-            from openpyxl import load_workbook
-            from openpyxl.styles import PatternFill
-
-            # Determine which rows are refunds from the preview dataframe
-            amt_num = pd.to_numeric(
-                rider_only_df["Transaction Amount"].astype(str).str.replace(r"[^\d\.\-]", "", regex=True),
-                errors="coerce"
-            )
-            refund_mask = rider_only_df["Trip Taken"].astype(str).eq("-") | amt_num.lt(0)
-
-            if refund_mask.any():
-                wb = load_workbook(buf)
-                ws = wb["DailyTrips"]
-
-                fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-
-                # Excel rows are 1-based and row 1 is header → add 2 to df index
-                rows_to_color = (refund_mask[refund_mask].index + 2).tolist()
-                max_col = ws.max_column
-
-                for r in rows_to_color:
-                    for c in range(1, max_col + 1):
-                        ws[f"{get_column_letter(c)}{r}"].fill = fill
-
-                # Save back into a fresh buffer
-                buf = BytesIO()
-                wb.save(buf)
-                buf.seek(0)
-
-        st.download_button(
-            "📥 Download",
-            buf,
-            file_name=out_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        buf, out_filename, rider_only_df = _run_pipeline(
+            file1=uploaded_file_1,
+            file2=uploaded_file_2,
+            highlight_refunds=highlight_refunds,
+            include_refunds_bottom=include_refunds_bottom,
+            internal_note_filter=internal_note_filter,
         )
+        if buf is None:
+            st.error("❌ Could not clean these files or they have no valid rows.")
+        else:
+            if rider_only_df is None or rider_only_df.empty:
+                st.info("No trips found.")
+            else:
+                st.success("✅ Sheets ready.")
+                st.dataframe(rider_only_df.head(50))
+
+            st.download_button(
+                "📥 Download",
+                buf,
+                file_name=out_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_combine",
+            )
